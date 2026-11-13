@@ -27,8 +27,6 @@ private const val OWN_CHANGE_GRACE_MS = 300L
 private const val SETTLED_REAPPLY_MS = 2_000L
 private const val FOCUS_RETRY_MS = 500L
 private const val FOCUS_REREQUEST_MS = 2_000L
-private const val SCO_TIMEOUT_MS = 4_000L
-private const val SCO_MAX_ATTEMPTS = 2
 private const val REASSERT_MAX_COUNT = 6
 private const val REASSERT_WINDOW_MS = 10_000L
 private const val EVENT_LOG_CAPACITY = 40
@@ -72,7 +70,8 @@ internal class VoiceAudioSession(
     private var appliedDeviceId: Int? = null
     private var ownChangeUntil = 0L
     private var savedMode: Int = AudioManager.MODE_NORMAL
-    private var savedMicMute = false
+    private var savedCommunicationDevice: AudioDeviceInfo? = null
+    private var savedSpeakerphoneOn = false
     private var appliedMode: Int? = null
     private var focusRequest: AudioFocusRequest? = null
     private var focusState: String = "none"
@@ -89,11 +88,6 @@ internal class VoiceAudioSession(
     private var pendingDeviceRefresh: Runnable? = null
     private var settledReapply: Runnable? = null
     private var telecomWatch: Runnable? = null
-    private var scoTimeout: Runnable? = null
-    private var scoRequested = false
-    private var scoConnected = false
-    private var scoAttempts = 0
-    private var bluetoothFailed = false
     private var micSilenced = false
     private var api31: Api31Listeners? = null
     private var recordingListener: RecordingListener? = null
@@ -123,9 +117,6 @@ internal class VoiceAudioSession(
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 AudioManager.ACTION_AUDIO_BECOMING_NOISY -> scheduleDeviceRefresh("becomingNoisy", force = true)
-                AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED -> onScoState(
-                    intent.getIntExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, AudioManager.SCO_AUDIO_STATE_ERROR),
-                )
             }
         }
     }
@@ -145,7 +136,8 @@ internal class VoiceAudioSession(
         } else {
             mode
         }
-        savedMicMute = audioManager.isMicrophoneMute
+        savedCommunicationDevice = safeCommunicationDevice(audioManager)
+        savedSpeakerphoneOn = audioManager.isSpeakerphoneOn
         FluxerRouteOwnership.holdsRoute = true
         limiter.reset()
         bluetoothFailed = false
@@ -153,7 +145,6 @@ internal class VoiceAudioSession(
         registerSessionListeners()
         deviceSnapshot = currentDeviceIds()
         setVolumeKeys(true)
-        audioManager.isMicrophoneMute = false
         applyRoute("activate", force = true)
         startKeepalive()
         scheduleSettledReapply()
@@ -226,7 +217,7 @@ internal class VoiceAudioSession(
             " waitingForExternalCall=$waitingForExternalCall" +
             " keepalive=${keepalive.isPlaying}" +
             " micSilenced=$micSilenced" +
-            " sco=requested:$scoRequested/connected:$scoConnected/failed:$bluetoothFailed" +
+            " classicA2dp=${isClassicBluetoothA2dpOutputApplied()}" +
             " devices=$devices" +
             " proximity=${proximity.isHeld}" +
             " events=${eventLog.snapshot()}"
@@ -313,6 +304,13 @@ internal class VoiceAudioSession(
             emitState("routeChanged")
             return
         }
+        if (isClassicBluetoothA2dpOutputApplied()) {
+            if (device != null) {
+                log("commDeviceChanged=${device.type}:${device.id} ignored for A2DP output")
+                safeClearCommunicationDevice(audioManager)
+            }
+            return
+        }
         if (waitingForExternalCall || device?.id == appliedDeviceId) {
             return
         }
@@ -329,26 +327,6 @@ internal class VoiceAudioSession(
         log("commDeviceChanged=${device?.type}:${device?.id} adopted")
         updateProximity()
         emitState("routeChanged")
-    }
-
-    internal fun onScoState(state: Int) {
-        log("scoState=$state")
-        if (!scoRequested) {
-            return
-        }
-        when (state) {
-            AudioManager.SCO_AUDIO_STATE_CONNECTED -> {
-                scoConnected = true
-                cancel(scoTimeout)
-                scoTimeout = null
-            }
-            AudioManager.SCO_AUDIO_STATE_DISCONNECTED -> {
-                if (scoConnected) {
-                    releaseLegacySco()
-                    scheduleDeviceRefresh("scoLost", force = true)
-                }
-            }
-        }
     }
 
     internal fun onMicrophoneSilenced(silenced: Boolean) {
@@ -369,20 +347,24 @@ internal class VoiceAudioSession(
         settledReapply = null
         cancel(telecomWatch)
         telecomWatch = null
-        releaseLegacySco()
         unregisterSessionListeners()
         keepalive.stop()
         if (!telecomOwnsRoute) {
-            releaseVoiceOutputRoute(audioManager)
+            releaseVoiceOutputRoute(
+                audioManager,
+                savedCommunicationDevice,
+                savedSpeakerphoneOn,
+            )
         }
         audioManager.mode = savedMode
         telecomOwnsRoute = false
         waitingForExternalCall = false
         abandonFocus()
-        audioManager.isMicrophoneMute = savedMicMute
         setVolumeKeys(false)
         appliedRoute = null
         appliedDeviceId = null
+        savedCommunicationDevice = null
+        savedSpeakerphoneOn = false
         focusLost = false
         micSilenced = false
         FluxerRouteOwnership.holdsRoute = false
@@ -429,12 +411,35 @@ internal class VoiceAudioSession(
         } else {
             automaticRouteNames(devices, hasEarpiece())
         }
-        val unavailable = if (bluetoothFailed) setOf(VoiceOutputRoute.Bluetooth) else emptySet()
-        val order = voiceRouteSearchOrder(desiredRoute, builtInDefault, names, unavailable)
+        val order = voiceRouteSearchOrder(desiredRoute, builtInDefault, names)
         var chosen: VoiceOutputRoute? = null
         var chosenDeviceId: Int? = null
         for (route in order) {
             val requestedId = if (route == desiredRoute) desiredDeviceId else null
+            if (route == VoiceOutputRoute.Bluetooth) {
+                val classicDevice = classicBluetoothA2dpDevice(devices, requestedId)
+                val communicationBluetoothAvailable =
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                        communicationDeviceCandidates(
+                            VoiceOutputRoute.Bluetooth,
+                            audioManager.availableCommunicationDevices,
+                            requestedId?.takeIf { it != classicDevice?.id },
+                        ).isNotEmpty()
+                if (classicDevice != null &&
+                    (classicDevice.id == requestedId || !communicationBluetoothAvailable)
+                ) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        if (safeCommunicationDeviceId(audioManager) != null) {
+                            safeClearCommunicationDevice(audioManager)
+                        }
+                    } else {
+                        applyVoiceOutputRoute(audioManager, route, requestedId, forceApply)
+                    }
+                    chosen = route
+                    chosenDeviceId = classicDevice.id
+                    break
+                }
+            }
             val deviceId = applyVoiceOutputRoute(audioManager, route, requestedId, forceApply)
             if (deviceId != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                 chosen = route
@@ -444,9 +449,6 @@ internal class VoiceAudioSession(
         }
         appliedRoute = chosen
         appliedDeviceId = chosenDeviceId
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            if (chosen == VoiceOutputRoute.Bluetooth) startLegacySco() else releaseLegacySco()
-        }
         log("apply reason=$reason force=$forceApply route=${chosen?.name} deviceId=$chosenDeviceId")
         updateProximity()
         emitState("routeChanged")
@@ -461,7 +463,6 @@ internal class VoiceAudioSession(
         if (handingOff) {
             telecomOwnsRoute = true
             cancelReasserts()
-            releaseLegacySco()
             safeClearCommunicationDevice(audioManager)
             abandonFocus()
             log("handoff to telecom calls=${calls.size}")
@@ -530,7 +531,18 @@ internal class VoiceAudioSession(
         return waitingForExternalCall
     }
 
+    private fun isClassicBluetoothA2dpOutputApplied(): Boolean {
+        val expected = appliedDeviceId ?: return false
+        return appliedRoute == VoiceOutputRoute.Bluetooth &&
+            outputDevices(audioManager).any {
+                it.id == expected && it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+            }
+    }
+
     private fun communicationDeviceDrifted(): Boolean {
+        if (isClassicBluetoothA2dpOutputApplied()) {
+            return safeCommunicationDeviceId(audioManager) != null
+        }
         val expected = appliedDeviceId ?: return false
         return safeCommunicationDeviceId(audioManager) != expected
     }
@@ -590,9 +602,6 @@ internal class VoiceAudioSession(
             }
             val added = ids - deviceSnapshot
             deviceSnapshot = ids
-            if (added.isNotEmpty()) {
-                bluetoothFailed = false
-            }
             log("devices $reason")
             if (isActive) {
                 applyRoute("devices")
@@ -684,7 +693,6 @@ internal class VoiceAudioSession(
         if (!receiversRegistered) {
             val filter = IntentFilter().apply {
                 addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
-                addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 context.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_NOT_EXPORTED)
@@ -726,58 +734,6 @@ internal class VoiceAudioSession(
             cancel(pendingDeviceRefresh)
             pendingDeviceRefresh = null
         }
-    }
-
-    @Suppress("DEPRECATION")
-    private fun startLegacySco() {
-        if (scoRequested) {
-            return
-        }
-        scoRequested = true
-        scoConnected = false
-        scoAttempts = 1
-        audioManager.startBluetoothSco()
-        audioManager.isBluetoothScoOn = true
-        scheduleScoTimeout()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun scheduleScoTimeout() {
-        cancel(scoTimeout)
-        val work = Runnable {
-            scoTimeout = null
-            if (!scoRequested || scoConnected) {
-                return@Runnable
-            }
-            if (scoAttempts < SCO_MAX_ATTEMPTS) {
-                scoAttempts++
-                log("sco retry attempt=$scoAttempts")
-                audioManager.stopBluetoothSco()
-                audioManager.startBluetoothSco()
-                audioManager.isBluetoothScoOn = true
-                scheduleScoTimeout()
-                return@Runnable
-            }
-            log("sco failed, falling back")
-            releaseLegacySco()
-            bluetoothFailed = true
-            applyRoute("scoFailed")
-        }
-        scoTimeout = work
-        handler.postDelayed(work, SCO_TIMEOUT_MS)
-    }
-
-    @Suppress("DEPRECATION")
-    private fun releaseLegacySco() {
-        cancel(scoTimeout)
-        scoTimeout = null
-        if (!scoRequested) {
-            return
-        }
-        audioManager.isBluetoothScoOn = false
-        audioManager.stopBluetoothSco()
-        scoRequested = false
-        scoConnected = false
     }
 
     private fun setVolumeKeys(enabled: Boolean) {
