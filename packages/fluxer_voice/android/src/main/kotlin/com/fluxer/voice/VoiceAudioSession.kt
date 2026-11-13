@@ -599,7 +599,6 @@ internal class VoiceAudioSession(
                 log("devices unchanged $reason")
                 return@Runnable
             }
-            val added = ids - deviceSnapshot
             deviceSnapshot = ids
             log("devices $reason")
             if (isActive) {
