@@ -140,7 +140,6 @@ internal class VoiceAudioSession(
         savedSpeakerphoneOn = audioManager.isSpeakerphoneOn
         FluxerRouteOwnership.holdsRoute = true
         limiter.reset()
-        bluetoothFailed = false
         requestFocus(retry = true)
         registerSessionListeners()
         deviceSnapshot = currentDeviceIds()
