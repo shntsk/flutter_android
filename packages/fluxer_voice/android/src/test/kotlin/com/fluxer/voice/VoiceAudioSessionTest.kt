@@ -248,6 +248,19 @@ class VoiceAudioSessionTest {
     }
 
     @Test
+    fun disconnectingA2dpRestoresTheBuiltInRoute() {
+        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
+        activate(VoiceOutputRoute.Bluetooth, explicit = true)
+
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece))
+        session.refreshRoute("a2dpDisconnected")
+
+        assertEquals(1, audioManager.communicationDevice?.id)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Speaker/1"))
+    }
+
+    @Test
     fun communicationDeviceDriftDoesNotOverrideAnA2dpOutput() {
         val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
         shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
@@ -483,7 +496,7 @@ class VoiceAudioSessionTest {
         activate(VoiceOutputRoute.Bluetooth, explicit = false)
 
         assertFalse(audioManager.isBluetoothScoOn)
-        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Speaker/1"))
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Speaker/null"))
     }
 
     @Test
