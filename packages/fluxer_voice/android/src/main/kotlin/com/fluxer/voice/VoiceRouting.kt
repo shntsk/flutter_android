@@ -23,7 +23,13 @@ internal enum class VoiceOutputRoute {
 }
 
 internal val bluetoothCommunicationDeviceTypes: List<Int> = listOf(
-    AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+    AudioDeviceInfo.TYPE_BLE_HEADSET,
+    AudioDeviceInfo.TYPE_HEARING_AID,
+    AudioDeviceInfo.TYPE_BLE_SPEAKER,
+)
+
+internal val bluetoothOutputDeviceTypes: List<Int> = listOf(
+    AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
     AudioDeviceInfo.TYPE_BLE_HEADSET,
     AudioDeviceInfo.TYPE_HEARING_AID,
     AudioDeviceInfo.TYPE_BLE_SPEAKER,
@@ -48,6 +54,18 @@ internal fun isWatchDevice(device: AudioDeviceInfo): Boolean {
 
 internal fun autoSelectableDevices(devices: List<AudioDeviceInfo>): List<AudioDeviceInfo> {
     return devices.filterNot(::isWatchDevice)
+}
+
+internal fun classicBluetoothA2dpDevice(
+    devices: List<AudioDeviceInfo>,
+    requestedDeviceId: Int? = null,
+): AudioDeviceInfo? {
+    val requested = devices.firstOrNull {
+        it.id == requestedDeviceId && it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+    }
+    return requested ?: devices.firstOrNull {
+        it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP && !isWatchDevice(it)
+    }
 }
 
 internal fun voiceOutputRouteFromName(name: String?): VoiceOutputRoute {
@@ -103,7 +121,7 @@ internal fun voiceOutputDeviceKind(type: Int): VoiceOutputDeviceKind? {
         AudioDeviceInfo.TYPE_USB_DEVICE,
         AudioDeviceInfo.TYPE_USB_ACCESSORY,
         -> VoiceOutputDeviceKind.Usb
-        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> VoiceOutputDeviceKind.Bluetooth
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> VoiceOutputDeviceKind.Bluetooth
         AudioDeviceInfo.TYPE_BLE_HEADSET,
         AudioDeviceInfo.TYPE_BLE_SPEAKER,
         -> VoiceOutputDeviceKind.BluetoothLe
@@ -173,11 +191,12 @@ internal fun communicationDeviceCandidates(
     devices: List<AudioDeviceInfo>,
     deviceId: Int? = null,
 ): List<AudioDeviceInfo> {
+    val routeTypes = communicationDeviceTypesForRoute(route)
     val requested = devices.firstOrNull {
-        it.id == deviceId && voiceOutputDeviceKind(it.type)?.route == route
+        it.id == deviceId && it.type in routeTypes
     }
     val automatic = autoSelectableDevices(devices)
-    val ordered = communicationDeviceTypesForRoute(route).flatMap { type -> automatic.filter { it.type == type } }
+    val ordered = routeTypes.flatMap { type -> automatic.filter { it.type == type } }
     return (listOfNotNull(requested) + ordered).distinctBy { it.id }
 }
 
@@ -228,17 +247,22 @@ internal fun availableVoiceOutputRouteNames(
     if (wiredConnected) {
         names.add("headset")
     }
-    if (outputTypes.any { it in bluetoothCommunicationDeviceTypes }) {
+    if (outputTypes.any { it in bluetoothOutputDeviceTypes }) {
         names.add("bluetooth")
     }
     return names
 }
 
 internal fun outputDevices(audioManager: AudioManager): List<AudioDeviceInfo> {
+    val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        return audioManager.availableCommunicationDevices
+        val communicationDevices = audioManager.availableCommunicationDevices
+        val a2dpOutputs = outputs.filter {
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+        }
+        return (communicationDevices + a2dpOutputs).distinctBy { it.id }
     }
-    return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+    return outputs
 }
 
 internal fun outputTypes(audioManager: AudioManager): Set<Int> {
@@ -260,7 +284,11 @@ internal fun requestedBluetoothAddress(
     ) {
         return null
     }
-    return outputDevices(audioManager).firstOrNull { it.id == deviceId }?.address
+    val device = outputDevices(audioManager).firstOrNull { it.id == deviceId } ?: return null
+    if (device.type !in bluetoothCommunicationDeviceTypes) {
+        return null
+    }
+    return device.address
 }
 
 internal fun applyVoiceOutputRoute(
@@ -316,15 +344,19 @@ internal fun safeClearCommunicationDevice(audioManager: AudioManager) {
     }
 }
 
-internal fun safeCommunicationDeviceId(audioManager: AudioManager): Int? {
+internal fun safeCommunicationDevice(audioManager: AudioManager): AudioDeviceInfo? {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
         return null
     }
     return try {
-        audioManager.communicationDevice?.id
+        audioManager.communicationDevice
     } catch (_: RuntimeException) {
         null
     }
+}
+
+internal fun safeCommunicationDeviceId(audioManager: AudioManager): Int? {
+    return safeCommunicationDevice(audioManager)?.id
 }
 
 internal fun voiceRouteSearchOrder(
@@ -470,11 +502,22 @@ internal fun voiceRouteDiagnostics(
         "build=${Build.DISPLAY}"
 }
 
-internal fun releaseVoiceOutputRoute(audioManager: AudioManager) {
+internal fun releaseVoiceOutputRoute(
+    audioManager: AudioManager,
+    previousCommunicationDevice: AudioDeviceInfo?,
+    previousSpeakerphoneOn: Boolean,
+) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        safeClearCommunicationDevice(audioManager)
+        val previous = previousCommunicationDevice?.let { saved ->
+            audioManager.availableCommunicationDevices.firstOrNull { it.id == saved.id }
+        }
+        if (previous != null) {
+            safeSetCommunicationDevice(audioManager, previous)
+        } else {
+            safeClearCommunicationDevice(audioManager)
+        }
         return
     }
     @Suppress("DEPRECATION")
-    audioManager.isSpeakerphoneOn = false
+    audioManager.isSpeakerphoneOn = previousSpeakerphoneOn
 }
