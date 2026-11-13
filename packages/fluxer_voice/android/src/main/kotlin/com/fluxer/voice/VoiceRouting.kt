@@ -504,8 +504,8 @@ internal fun voiceRouteDiagnostics(
 
 internal fun releaseVoiceOutputRoute(
     audioManager: AudioManager,
-    previousCommunicationDevice: AudioDeviceInfo?,
-    previousSpeakerphoneOn: Boolean,
+    previousCommunicationDevice: AudioDeviceInfo? = null,
+    previousSpeakerphoneOn: Boolean = false,
 ) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         val previous = previousCommunicationDevice?.let { saved ->
