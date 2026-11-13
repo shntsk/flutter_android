@@ -160,10 +160,10 @@ class VoiceAudioSessionTest {
     }
 
     @Test
-    fun microphoneMuteIsRestoredOnRelease() {
+    fun systemMicrophoneMuteIsNotChangedByVoiceSession() {
         audioManager.isMicrophoneMute = true
         activate(VoiceOutputRoute.Speaker)
-        assertFalse(audioManager.isMicrophoneMute)
+        assertTrue(audioManager.isMicrophoneMute)
 
         session.release("call")
 
@@ -201,14 +201,86 @@ class VoiceAudioSessionTest {
 
     @Test
     fun watchesAreSkippedUnlessPickedExplicitly() {
-        val watch = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO, id = 5, name = "Galaxy Watch6")
-        shadowOf(audioManager).setAvailableCommunicationDevices(listOf(speaker, earpiece, watch))
+        val watch = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 5, name = "Galaxy Watch6")
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, watch))
 
         activate(VoiceOutputRoute.Bluetooth, explicit = false)
         assertEquals(1, audioManager.communicationDevice?.id)
 
         session.setPreferredRoute(VoiceOutputRoute.Bluetooth, 5, true)
-        assertEquals(5, audioManager.communicationDevice?.id)
+        assertNull(audioManager.communicationDevice)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Bluetooth/5"))
+    }
+
+    @Test
+    fun classicBluetoothUsesA2dpWithoutSelectingACommunicationDevice() {
+        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
+
+        activate(VoiceOutputRoute.Bluetooth, explicit = false)
+
+        assertNull(audioManager.communicationDevice)
+        assertTrue(session.outputDeviceMessages().any { it.id == 9L && it.active })
+    }
+
+    @Test
+    fun explicitA2dpSelectionTakesPriorityOverAvailableLeAudio() {
+        val classic = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
+        val le = device(AudioDeviceInfo.TYPE_BLE_HEADSET, id = 10)
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, classic))
+        shadowOf(audioManager).setAvailableCommunicationDevices(listOf(speaker, earpiece, le))
+
+        activate(VoiceOutputRoute.Bluetooth, explicit = false)
+        session.setPreferredRoute(VoiceOutputRoute.Bluetooth, 9, true)
+
+        assertNull(audioManager.communicationDevice)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Bluetooth/9"))
+    }
+
+    @Test
+    fun leAudioRemainsACommunicationRoute() {
+        val le = device(AudioDeviceInfo.TYPE_BLE_HEADSET, id = 10)
+        shadowOf(audioManager).setAvailableCommunicationDevices(listOf(speaker, earpiece, le))
+
+        activate(VoiceOutputRoute.Bluetooth, explicit = false)
+
+        assertEquals(10, audioManager.communicationDevice?.id)
+    }
+
+    @Test
+    fun disconnectingA2dpRestoresTheBuiltInRoute() {
+        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
+        activate(VoiceOutputRoute.Bluetooth, explicit = true)
+
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece))
+        session.refreshRoute("a2dpDisconnected")
+
+        assertEquals(1, audioManager.communicationDevice?.id)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Speaker/1"))
+    }
+
+    @Test
+    fun communicationDeviceDriftDoesNotOverrideAnA2dpOutput() {
+        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 9)
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
+        activate(VoiceOutputRoute.Bluetooth, explicit = true)
+
+        drift(speaker)
+
+        assertNull(audioManager.communicationDevice)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Bluetooth/9"))
+    }
+
+    @Test
+    fun previousCommunicationDeviceIsRestoredOnRelease() {
+        assertTrue(audioManager.setCommunicationDevice(earpiece))
+        activate(VoiceOutputRoute.Speaker)
+        assertEquals(1, audioManager.communicationDevice?.id)
+
+        session.release("call")
+
+        assertEquals(2, audioManager.communicationDevice?.id)
     }
 
     @Test
@@ -403,50 +475,42 @@ class VoiceAudioSessionTest {
     @Test
     @Config(sdk = [Build.VERSION_CODES.R])
     @Suppress("DEPRECATION")
-    fun legacyBluetoothFallsBackWhenTheHeadsetNeverConnects() {
-        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO, id = 7)
+    fun legacyAndroidUsesA2dpWithoutStartingSco() {
+        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, id = 7)
         shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
 
-        session.setPreferredRoute(VoiceOutputRoute.Bluetooth, null, true)
-        session.acquire("call")
-        assertTrue(audioManager.isBluetoothScoOn)
-
-        idle(8_500)
+        activate(VoiceOutputRoute.Bluetooth, explicit = false)
 
         assertFalse(audioManager.isBluetoothScoOn)
-        assertTrue(session.diagnostics(), session.diagnostics().contains("failed:true"))
+        assertFalse(audioManager.isSpeakerphoneOn)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Bluetooth/7"))
     }
 
     @Test
     @Config(sdk = [Build.VERSION_CODES.R])
     @Suppress("DEPRECATION")
-    fun legacyBluetoothStaysWhenTheHeadsetConnects() {
+    fun scoOnlyHeadsetIsNotSelectedAsBluetoothOutput() {
         val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO, id = 7)
         shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
 
-        session.setPreferredRoute(VoiceOutputRoute.Bluetooth, null, true)
-        session.acquire("call")
-        session.onScoState(AudioManager.SCO_AUDIO_STATE_CONNECTED)
-        idle(8_500)
+        activate(VoiceOutputRoute.Bluetooth, explicit = false)
 
-        assertTrue(audioManager.isBluetoothScoOn)
-        assertTrue(session.diagnostics(), session.diagnostics().contains("connected:true"))
+        assertFalse(audioManager.isBluetoothScoOn)
+        assertTrue(session.diagnostics(), session.diagnostics().contains("applied=Speaker/null"))
     }
 
     @Test
     @Config(sdk = [Build.VERSION_CODES.R])
     @Suppress("DEPRECATION")
-    fun legacyBluetoothRestartsAfterTheLinkDrops() {
-        val headset = device(AudioDeviceInfo.TYPE_BLUETOOTH_SCO, id = 7)
-        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece, headset))
-        session.setPreferredRoute(VoiceOutputRoute.Bluetooth, null, true)
-        session.acquire("call")
-        session.onScoState(AudioManager.SCO_AUDIO_STATE_CONNECTED)
+    fun previousSpeakerphoneStateIsRestoredOnRelease() {
+        audioManager.isSpeakerphoneOn = true
+        shadowOf(audioManager).setOutputDevices(listOf(speaker, earpiece))
 
-        session.onScoState(AudioManager.SCO_AUDIO_STATE_DISCONNECTED)
-        idle(400)
+        activate(VoiceOutputRoute.Earpiece)
+        assertFalse(audioManager.isSpeakerphoneOn)
 
-        assertTrue(audioManager.isBluetoothScoOn)
-        assertTrue(session.diagnostics(), session.diagnostics().contains("requested:true/connected:false"))
+        session.release("call")
+
+        assertTrue(audioManager.isSpeakerphoneOn)
     }
 }

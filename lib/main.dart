@@ -1,3 +1,5 @@
+// ignore_for_file: experimental_member_use
+
 import 'dart:async';
 import 'dart:io';
 import 'dart:ui';
@@ -49,6 +51,16 @@ import 'package:fluxer_app/l10n/fluxer_localizations_delegates.dart';
 import 'package:fluxer_app/material_ui.dart';
 import 'package:image_picker_android/image_picker_android.dart';
 import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
+import 'package:livekit_client/livekit_client.dart'
+    show
+        AndroidAudioAttributesContentType,
+        AndroidAudioAttributesUsageType,
+        AndroidAudioFocusMode,
+        AndroidAudioMode,
+        AndroidAudioSessionConfiguration,
+        AndroidAudioStreamType,
+        AudioSessionOptions,
+        LiveKitClient;
 
 void _configureImagePicker() {
   if (!Platform.isAndroid) {
@@ -147,6 +159,22 @@ Future<void> _bootstrapFluxer(List<String> args) async {
     installNativePasteHandler();
   }
   configureFluxerMobileDetection();
+  if (Platform.isAndroid) {
+    await _bootstrapStep('app.bootstrap.livekit_audio', () async {
+      await LiveKitClient.initialize(
+        initialAudioSessionOptions: const AudioSessionOptions.communication(
+          android: AndroidAudioSessionConfiguration(
+            audioMode: AndroidAudioMode.inCommunication,
+            manageAudioFocus: true,
+            focusMode: AndroidAudioFocusMode.gain,
+            streamType: AndroidAudioStreamType.voiceCall,
+            usageType: AndroidAudioAttributesUsageType.media,
+            contentType: AndroidAudioAttributesContentType.unknown,
+          ),
+        ),
+      );
+    });
+  }
   final int? totalMemoryBytes = androidTotalMemoryBytes();
   configureFluxerImageCache(totalMemoryBytes: totalMemoryBytes);
   configureFluxerGpuResourceCache(totalMemoryBytes: totalMemoryBytes);
